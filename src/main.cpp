@@ -50,14 +50,30 @@ int main(int argc, char **argv) {
   // You can use print statements as follows for debugging, they'll be visible when running tests.
   std::cout << "Logs from your program will appear here!\n";
 
-  // Uncomment the code below to pass the first stage
-  // 
   int clinet_fd = accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
   std::cout << "Client connected\n";
+
   const char *response = "+PONG\r\n";
-  send(clinet_fd, response, strlen(response), 0);
-  // 
+  char buffer[1024];
+
+  while (true) {
+    ssize_t bytes_received = recv(clinet_fd, buffer, sizeof(buffer), 0);
+    if (bytes_received < 0) {
+      std::cerr << "recv failed\n";
+      break;
+    }
+
+    if (bytes_received == 0) {
+      std::cout << "Client disconnected\n";
+      break;
+    }
+
+    send(clinet_fd, response, strlen(response), 0);
+  }
+  //send(clinet_fd, response, strlen(response), 0);
+
   close(server_fd);
+  close(clinet_fd);
 
   return 0;
 }
