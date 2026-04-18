@@ -7,17 +7,33 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <pthread.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <vector>
 #include <map>
+#include <thread>
 
 #define MAX_EVENTS 3 // We only need handle two diffrent client connection events, 
 // so 3 is enough for us (one for server socket, two for client sockets) for this part
 
 // brut-force SET container
-std::map<std::string, std::string> key_value_store; 
+std::map<std::string, std::string> key_value_store;
+
+void handle_expiry_timeout(const std::string& key, std::string option, int timeout) {
+  std::thread([key, option, timeout]() {
+    if (option == "EX" || option == "ex" || option == "Ex") {
+      sleep(timeout);
+      key_value_store.erase(key);
+
+    } else if (option == "PX" || option == "px" || option == "Px" ) {
+      usleep(timeout * 1000);
+      key_value_store.erase(key);
+
+    } else {
+      std::cerr << "Invalid expiry option: " << option << "\n";
+    }
+  }).detach();
+}
 
 std::vector<std::string> parser(const std::string& bulk_string) {
   std::vector<std::string> tokens;
@@ -83,6 +99,53 @@ void set_non_blocking(int fd) {
   }
   if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
     std::cerr << "Failed to set non-blocking mode\n";
+  }
+}
+
+void response_to_client(char* buffer, int client_fd) {
+  std::vector<std::string> tokens = parser(buffer);
+  std::string response;
+
+  if (!tokens.empty() && tokens[0] == "ECHO" || tokens[0] == "echo" || tokens[0] == "Echo") {
+    if (tokens.size() > 1) {
+    response = serialize_to_bulk_string({tokens[1]});
+
+    } else {
+      response = serialize_to_bulk_string({});
+    }
+
+  } else if (!tokens.empty() && tokens[0] == "PING" || tokens[0] == "ping" || tokens[0] == "Ping") {
+    response = "+PONG\r\n";
+
+  } else if (!tokens.empty() && tokens[0] == "SET" || tokens[0] == "set" || tokens[0] == "Set") {
+    if (tokens.size() > 4) {
+      key_value_store[tokens[1]] = tokens[2];
+      handle_expiry_timeout(tokens[1], tokens[3], std::stoi(tokens[4]));
+      response = "+OK\r\n";
+
+    } else if (tokens.size() > 2) {
+      key_value_store[tokens[1]] = tokens[2];
+      response = "+OK\r\n";
+
+    } else {
+      response = serialize_to_bulk_string({"Invalid SET command format"});
+    }
+
+  } else if (!tokens.empty() && tokens[0] == "GET" || tokens[0] == "get" || tokens[0] == "Get") {
+    if (tokens.size() > 1 && key_value_store.find(tokens[1]) != key_value_store.end()) {
+      response = serialize_to_bulk_string({key_value_store[tokens[1]]});
+
+    } else {
+      response = "$-1\r\n";
+    }
+
+  } else {
+    response = serialize_to_bulk_string({"Unknown command"});
+  }
+
+  if (write(client_fd, response.c_str(), response.size()) == -1) {
+    std::cerr << "Failed to send response to client\n";
+    close(client_fd);
   }
 }
 int main(int argc, char **argv) {
@@ -181,42 +244,7 @@ int main(int argc, char **argv) {
 
         std::cout << "Received from client: " << buffer;
 
-        std::vector<std::string> tokens = parser(buffer);
-     
-        std::string response;
-
-        if (!tokens.empty() && tokens[0] == "ECHO" || tokens[0] == "echo" || tokens[0] == "Echo") {
-          if (tokens.size() > 1) {
-            response = serialize_to_bulk_string({tokens[1]});
-          } else {
-            response = serialize_to_bulk_string({});
-          }
-        } else if (!tokens.empty() && tokens[0] == "PING" || tokens[0] == "ping" || tokens[0] == "Ping") {
-          response = "+PONG\r\n";
-        } else if (!tokens.empty() && tokens[0] == "SET" || tokens[0] == "set" || tokens[0] == "Set") {
-          if (tokens.size() > 2) {
-            key_value_store[tokens[1]] = tokens[2];
-            response = "+OK\r\n";
-          } else {
-            response = serialize_to_bulk_string({"Invalid SET command format"});
-          }
-        } else if (!tokens.empty() && tokens[0] == "GET" || tokens[0] == "get" || tokens[0] == "Get") {
-          if (key_value_store.find(tokens[1]) != key_value_store.end()) {
-            response = serialize_to_bulk_string({key_value_store[tokens[1]]});
-            
-          } else {
-          response = "$-1\r\n";
-          }
-        }
-        
-        else {
-          response = serialize_to_bulk_string({"Unknown command"});
-        }
-
-        if (write(fd, response.c_str(), response.size()) == -1) {
-          std::cerr << "Failed to send response to client\n";
-          close(fd);
-        }
+        response_to_client(buffer, fd);
       }
     }
   }
