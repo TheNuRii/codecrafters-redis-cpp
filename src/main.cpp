@@ -11,9 +11,13 @@
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <vector>
+#include <map>
 
 #define MAX_EVENTS 3 // We only need handle two diffrent client connection events, 
-// so 3 is enough for us (one for server socket, two for client sockets) for this part 
+// so 3 is enough for us (one for server socket, two for client sockets) for this part
+
+// brut-force SET container
+std::map<std::string, std::string> key_value_store; 
 
 std::vector<std::string> parser(const std::string& bulk_string) {
   std::vector<std::string> tokens;
@@ -189,7 +193,23 @@ int main(int argc, char **argv) {
           }
         } else if (!tokens.empty() && tokens[0] == "PING" || tokens[0] == "ping" || tokens[0] == "Ping") {
           response = "+PONG\r\n";
-        } else {
+        } else if (!tokens.empty() && tokens[0] == "SET" || tokens[0] == "set" || tokens[0] == "Set") {
+          if (tokens.size() > 2) {
+            key_value_store[tokens[1]] = tokens[2];
+            response = "+OK\r\n";
+          } else {
+            response = serialize_to_bulk_string({"Invalid SET command format"});
+          }
+        } else if (!tokens.empty() && tokens[0] == "GET" || tokens[0] == "get" || tokens[0] == "Get") {
+          if (key_value_store.find(tokens[1]) != key_value_store.end()) {
+            response = serialize_to_bulk_string({key_value_store[tokens[1]]});
+            
+          } else {
+          response = "$-1\r\n";
+          }
+        }
+        
+        else {
           response = serialize_to_bulk_string({"Unknown command"});
         }
 
