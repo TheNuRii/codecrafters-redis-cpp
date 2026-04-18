@@ -170,11 +170,12 @@ void response_to_client(char* buffer, int client_fd) {
     }
 
   } else if (!tokens.empty() && tokens[0] == "RPUSH") {
+    std::vector<std::string> element_list(tokens.begin() + 2, tokens.end());
     if (is_list_exists(tokens[1])) {
+      rpush_to_exisiting_list(tokens[1], element_list);
       response = ":" + std::to_string(list_store[tokens[1]].size()) + "\r\n";
 
     } else {
-      std::vector<std::string> element_list(tokens.begin() + 2, tokens.end());
       create_list_if_not_exists(tokens[1], element_list);
       response = ":" + std::to_string(list_store[tokens[1]].size()) + "\r\n";
     }
