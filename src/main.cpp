@@ -21,8 +21,6 @@ std::map<std::string, std::string> key_value_store;
 
 std::map<std::string, std::vector<std::string>> list_store;
 
-
-
 bool is_list_exists(const std::string& key) {
   return list_store.find(key) != list_store.end();
 }
@@ -114,8 +112,31 @@ std::vector<std::string> parser(const std::string& bulk_string) {
 
 std::string serialize_to_bulk_string(const std::vector<std::string>& tokens){
   std::string response;
+
   for (const auto& token : tokens) {
     response += "$" + std::to_string(token.size()) + "\r\n" + token + "\r\n";
+  }
+
+  return response;
+}
+
+std::string serialize_to_array(const std::string& key, int start, int end) {
+  int size = list_store[key].size();
+  // Handle negative indices like Redis
+  if (start < 0) start = size + start;
+  if (end < 0) end = size + end;
+  if (start < 0) start = 0;
+  if (end >= size) end = size - 1;
+  if (end < start || start >= size) {
+    // Return empty array if out of bounds
+    return "*0\r\n";
+  }
+
+  std::vector<std::string> elementToView(list_store[key].begin() + start, list_store[key].begin() + end + 1);
+  std::string response = "*" + std::to_string(elementToView.size()) + "\r\n";
+
+  for (int i = 0; i < elementToView.size(); ++i) {
+    response += "$" + std::to_string(elementToView[i].size()) + "\r\n" + elementToView[i] + "\r\n";
   }
 
   return response;
@@ -179,9 +200,16 @@ void response_to_client(char* buffer, int client_fd) {
       create_list_if_not_exists(tokens[1], element_list);
       response = ":" + std::to_string(list_store[tokens[1]].size()) + "\r\n";
     }
-  }
-  
-  else {
+
+  } else if (!tokens.empty() && tokens[0] == "LRANGE") {
+    int start = std::stoi(tokens[2]);
+    int end = std::stoi(tokens[3]);
+    const std::string key = tokens[1];
+
+    //std::vector<std::string> element_to_view(list_store[tokens[1]].begin() + start, list_store[tokens[1]].end() - end);
+    response = serialize_to_array(key, start, end);
+
+  }else {
     response = serialize_to_bulk_string({"Unknown command"});
   }
 
