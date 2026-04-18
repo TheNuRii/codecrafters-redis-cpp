@@ -10,9 +10,66 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <vector>
 
 #define MAX_EVENTS 3 // We only need handle two diffrent client connection events, 
 // so 3 is enough for us (one for server socket, two for client sockets) for this part 
+
+std::vector<std::string> parser(const std::string& bulk_string) {
+  std::vector<std::string> tokens;
+  
+  if (bulk_string.empty() || bulk_string[0] != '*') {
+    std::cerr << "Invalid RESP format: Expected array format starting with '*'\n";
+    return tokens;
+  }
+
+  size_t pos = 1; // skip '*'
+  size_t end_pos = bulk_string.find("\r\n", pos);
+  if (end_pos == std::string::npos) {
+    std::cerr << "Invalid RESP format: Missing CRLF after array lenght\n";
+    return tokens;
+  }
+
+  int array_lenght = std::stoi(bulk_string.substr(pos, end_pos - pos));
+  pos = end_pos + 2;
+
+  for (int i = 0; i < array_lenght; ++i) {
+
+    if (pos >= bulk_string.size() || bulk_string[pos] != '$') {
+      std::cerr << "Invaild RESP format: Expected bulk string starting with '$'\n";
+      return tokens;
+    }
+
+    pos++; // skip '$
+    end_pos = bulk_string.find("\r\n", pos);
+    if (end_pos == std::string::npos) {
+      std::cerr << "Invalid RESP format: Missing CRLF after bulk string lenght\n";
+      return tokens;
+    }
+
+    int bulk_string_lenght = std::stoi(bulk_string.substr(pos, end_pos - pos));
+    pos = end_pos + 2; // skip CRLF
+
+    if (pos + bulk_string_lenght > bulk_string.size()) {
+      std::cerr << "Invalid RESP format: Bulk string lenght exceeds reamaining data\n";
+      return tokens;
+    }
+
+    tokens.push_back(bulk_string.substr(pos, bulk_string_lenght));
+    pos += bulk_string_lenght + 2; // skip bulk string and CRLF
+  }
+
+  return tokens;
+}
+
+std::string serialize_to_bulk_string(const std::vector<std::string>& tokens){
+  std::string response;
+  for (const auto& token : tokens) {
+    response += "$" + std::to_string(token.size()) + "\r\n" + token + "\r\n";
+  }
+
+  return response;
+}
 
 void set_non_blocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0); // get current flags
@@ -78,8 +135,6 @@ int main(int argc, char **argv) {
   }
 
   epoll_event events[MAX_EVENTS];
-
-  const char *response = "+PONG\r\n";
   char buffer[1024];
 
   std::cout << "Waiting for a client to connect...\n";
@@ -111,10 +166,9 @@ int main(int argc, char **argv) {
         }
         std::cout << "Client connected: " << inet_ntoa(client_addr.sin_addr) << "\n";
       } else {
-        // Data from a client
+
         ssize_t count = read(fd, buffer, sizeof(buffer) - 1);
         if (count <= 0) {
-          // Client disconnected or error
           std::cerr << "Client disconnected or read error\n";
           close(fd);
           continue;
@@ -123,46 +177,31 @@ int main(int argc, char **argv) {
 
         std::cout << "Received from client: " << buffer;
 
-        // Respond with PONG
-        if (write(fd, response, strlen(response)) < 0) {
-          std::cerr << "Failed to write response to client\n";
+        std::vector<std::string> tokens = parser(buffer);
+     
+        std::string response;
+
+        if (!tokens.empty() && tokens[0] == "ECHO" || tokens[0] == "echo" || tokens[0] == "Echo") {
+          if (tokens.size() > 1) {
+            response = serialize_to_bulk_string({tokens[1]});
+          } else {
+            response = serialize_to_bulk_string({});
+          }
+        } else if (!tokens.empty() && tokens[0] == "PING" || tokens[0] == "ping" || tokens[0] == "Ping") {
+          response = "+PONG\r\n";
+        } else {
+          response = serialize_to_bulk_string({"Unknown command"});
+        }
+
+        if (write(fd, response.c_str(), response.size()) == -1) {
+          std::cerr << "Failed to send response to client\n";
           close(fd);
-          continue;
         }
       }
     }
   }
-  /*
-  struct sockaddr_in client_addr;
-  int client_addr_len = sizeof(client_addr);
-  
 
-  // You can use print statements as follows for debugging, they'll be visible when running tests.
-  std::cout << "Logs from your program will appear here!\n";
-
-  int clinet_fd = accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
-  std::cout << "Client connected\n";
-
-  while (true) {
-    //keep the main thread alive to accept new clients
-    int new_client_fd = accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
-    if (new_client_fd <= 0) {
-      std::cerr << "Failed to accept new client\n";
-      close(new_client_fd);
-      continue;
-    }
-
-    int *pclinet = new int;
-    *pclinet = new_client_fd;
-    pthread_t thread_id;
-
-    if (pthread_create(&thread_id, nullptr, handle_client, pclinet) != 0) {
-      std::cerr << "Failed to create thread for new client\n";
-      delete pclinet;
-      continue;
-    }
-  }
-
-  */
+  close(server_fd);
+  close(epoll_fd);
   return 0;
 }
