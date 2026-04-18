@@ -19,6 +19,36 @@
 // brut-force SET container
 std::map<std::string, std::string> key_value_store;
 
+std::map<std::string, std::vector<std::string>> list_store;
+
+
+
+bool is_list_exists(const std::string& key) {
+  return list_store.find(key) != list_store.end();
+}
+
+void create_list_if_not_exists(const std::string& key, std::vector<std::string>& list_of_elemets) {
+  if (list_store.find(key) == list_store.end()) {
+    list_store[key] = std::vector<std::string>(list_of_elemets);
+
+  } else {
+    std::cerr << "List with key '" << key << "' already exists. Use rpush_to_exisiting_list to add elements to it.\n";
+  }
+
+  return;
+}
+
+void rpush_to_exisiting_list(const std::string& key, const std::vector<std::string>& elements) {
+  if (list_store.find(key) != list_store.end()) {
+    list_store[key].insert(list_store[key].end(), elements.begin(), elements.end());
+  
+  } else {
+    std::cerr << "List with key '" << key << "' does not exist. Use create_list_if_not_exists to create it first.\n";
+  }
+
+  return;
+}
+
 void handle_expiry_timeout(const std::string& key, std::string option, int timeout) {
   std::thread([key, option, timeout]() {
     if (option == "EX" || option == "ex" || option == "Ex") {
@@ -139,7 +169,18 @@ void response_to_client(char* buffer, int client_fd) {
       response = "$-1\r\n";
     }
 
-  } else {
+  } else if (!tokens.empty() && tokens[0] == "RPUSH") {
+    if (is_list_exists(tokens[1])) {
+      response = ":" + std::to_string(list_store[tokens[1]].size()) + "\r\n";
+
+    } else {
+      std::vector<std::string> element_list(tokens.begin() + 2, tokens.end());
+      create_list_if_not_exists(tokens[1], element_list);
+      response = ":" + std::to_string(list_store[tokens[1]].size()) + "\r\n";
+    }
+  }
+  
+  else {
     response = serialize_to_bulk_string({"Unknown command"});
   }
 
@@ -148,6 +189,7 @@ void response_to_client(char* buffer, int client_fd) {
     close(client_fd);
   }
 }
+
 int main(int argc, char **argv) {
   // Flush after every std::cout / std::cerr
   std::cout << std::unitbuf;
