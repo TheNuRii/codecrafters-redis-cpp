@@ -12,6 +12,7 @@
 #include <vector>
 #include <map>
 #include <thread>
+#include <algorithm>
 
 #define MAX_EVENTS 3 // We only need handle two diffrent client connection events, 
 // so 3 is enough for us (one for server socket, two for client sockets) for this part
@@ -40,6 +41,33 @@ void rpush_to_exisiting_list(const std::string& key, const std::vector<std::stri
   if (list_store.find(key) != list_store.end()) {
     list_store[key].insert(list_store[key].end(), elements.begin(), elements.end());
   
+  } else {
+    std::cerr << "List with key '" << key << "' does not exist. Use create_list_if_not_exists to create it first.\n";
+  }
+
+  return;
+}
+
+void lpush_to_new_list(const std::string& key, const std::vector<std::string>& elements) {
+  if (list_store.find(key) == list_store.end()) {
+    list_store[key] = std::vector<std::string>();
+    //list_store[key].insert(list_store[key].begin(), elements.begin(), elements.end());
+    list_store[key].insert(list_store[key].end(), elements.begin(), elements.end());
+    std::copy_backward(list_store[key].begin(), list_store[key].end(), list_store[key].end());
+  } else {
+    std::cerr << "List with key '" << key << "' already exists. Use lpush_to_exisiting_list to add elements to it.\n";
+  }
+
+  return;
+}
+//TO DO
+void lpush_to_exisiting_list(const std::string& key, const std::vector<std::string>& elements) {
+  if (list_store.find(key) != list_store.end()) {
+    for (const auto& elem : elements) {
+    list_store[key].insert(list_store[key].begin(), elem);
+    }  
+
+
   } else {
     std::cerr << "List with key '" << key << "' does not exist. Use create_list_if_not_exists to create it first.\n";
   }
@@ -194,19 +222,29 @@ void response_to_client(char* buffer, int client_fd) {
     std::vector<std::string> element_list(tokens.begin() + 2, tokens.end());
     if (is_list_exists(tokens[1])) {
       rpush_to_exisiting_list(tokens[1], element_list);
-      response = ":" + std::to_string(list_store[tokens[1]].size()) + "\r\n";
 
     } else {
       create_list_if_not_exists(tokens[1], element_list);
-      response = ":" + std::to_string(list_store[tokens[1]].size()) + "\r\n";
     }
 
+    response = ":" + std::to_string(list_store[tokens[1]].size()) + "\r\n";
+  
+  } else if (!tokens.empty() && tokens[0] == "LPUSH") {
+    std::vector<std::string> element_list(tokens.begin() + 2, tokens.end());
+    if (is_list_exists(tokens[1])) {
+      lpush_to_exisiting_list(tokens[1], element_list);
+      
+    } else {
+      lpush_to_new_list(tokens[1], element_list);
+    }
+    
+    response = ":" + std::to_string(list_store[tokens[1]].size()) + "\r\n";
+ 
   } else if (!tokens.empty() && tokens[0] == "LRANGE") {
     int start = std::stoi(tokens[2]);
     int end = std::stoi(tokens[3]);
     const std::string key = tokens[1];
 
-    //std::vector<std::string> element_to_view(list_store[tokens[1]].begin() + start, list_store[tokens[1]].end() - end);
     response = serialize_to_array(key, start, end);
 
   }else {
