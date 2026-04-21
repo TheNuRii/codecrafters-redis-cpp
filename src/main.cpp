@@ -66,13 +66,22 @@ void lpush_to_exisiting_list(const std::string& key, const std::vector<std::stri
     for (const auto& elem : elements) {
     list_store[key].insert(list_store[key].begin(), elem);
     }  
-
-
+  
   } else {
     std::cerr << "List with key '" << key << "' does not exist. Use create_list_if_not_exists to create it first.\n";
   }
 
   return;
+}
+
+int get_list_size(const std::string& key) {
+  if (list_store.find(key) != list_store.end()) {
+    return list_store[key].size();
+
+  } else {
+    std::cerr << "List with key '" << key << "' does not exist.\n";
+    return -1; // Indicate error
+  }
 }
 
 void handle_expiry_timeout(const std::string& key, std::string option, int timeout) {
@@ -247,7 +256,18 @@ void response_to_client(char* buffer, int client_fd) {
 
     response = serialize_to_array(key, start, end);
 
-  }else {
+  } else if (!tokens.empty() && tokens[0] == "LLEN") {
+    const std::string key = tokens[1];
+    int size =  get_list_size(key);
+
+    if (size != -1) {
+      response = ":" + std::to_string(size) + "\r\n";
+
+    } else {
+      response = ":" + std::to_string(0) + "\r\n";
+    }
+
+  } else {
     response = serialize_to_bulk_string({"Unknown command"});
   }
 
