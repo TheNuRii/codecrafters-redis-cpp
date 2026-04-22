@@ -267,6 +267,21 @@ void response_to_client(char* buffer, int client_fd) {
       response = ":" + std::to_string(0) + "\r\n";
     }
 
+  } else if (!tokens.empty() && tokens[0] == "LPOP") {
+    const std::string key = tokens[1];
+    if (is_list_exists(key)) {
+      if (!list_store[key].empty()) {
+        std::string poped_element = list_store[key].front();
+        list_store[key].erase(list_store[key].begin());
+        response = serialize_to_bulk_string({poped_element});
+      } else {
+        response = "-1\r\n";
+      }
+
+    } else {
+      response = "-1\r\n";
+    }
+  
   } else {
     response = serialize_to_bulk_string({"Unknown command"});
   }
