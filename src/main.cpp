@@ -269,18 +269,32 @@ void response_to_client(char* buffer, int client_fd) {
 
   } else if (!tokens.empty() && tokens[0] == "LPOP") {
     const std::string key = tokens[1];
-    if (is_list_exists(key)) {
-      if (!list_store[key].empty()) {
-        std::string poped_element = list_store[key].front();
-        list_store[key].erase(list_store[key].begin());
-        response = serialize_to_bulk_string({poped_element});
-      } else {
-        response = "-1\r\n";
-      }
+    
+    if (tokens.size() > 2) {
+      int count = std::stoi(tokens[2]);
+      if (is_list_exists(key) && !list_store[key].empty()) {
+        std::vector<std::string> poped_elements;
 
+        for (int i = 0; i < count && !list_store[key].empty(); ++i) {
+          poped_elements.push_back(list_store[key].front());
+          list_store[key].erase(list_store[key].begin());
+        }
+
+        response = "*" + std::to_string(poped_elements.size()) + "\r\n";
+
+        for (const auto& elem : poped_elements) {
+          response += "$" + std::to_string(elem.size()) + "\r\n" + elem + "\r\n";
+        }
+      }
+    } else if (is_list_exists(key) && !list_store[key].empty()) {
+      std::string poped_element = list_store[key].front();
+      list_store[key].erase(list_store[key].begin());
+      response = serialize_to_bulk_string({poped_element});  
+    
     } else {
       response = "-1\r\n";
     }
+  
   
   } else {
     response = serialize_to_bulk_string({"Unknown command"});
