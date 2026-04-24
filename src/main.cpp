@@ -38,6 +38,7 @@ public:
   std::unordered_map<std::string, std::vector<std::string>> lists;
   std::unordered_map<std::string, std::vector<Connection*>> blocked;
   std::unordered_map<std::string, std::chrono::steady_clock::time_point> expiry;
+  std::unordered_map<std::string, std::string> type;
 };
 
 // ----------------- COMMAND parsing and execution
@@ -116,7 +117,7 @@ private:
 
 class Command {
 public:
-    virtual std::string execute(DataStore&, Connection&, const std::vector<std::string>&) = 0;
+    virtual std::string execute(DataStore& store, Connection&, const std::vector<std::string>&) = 0;
     virtual ~Command() = default;
 };
 
@@ -127,6 +128,7 @@ public:
             return simple_string("PONG");
         }
         return simple_string(args[0]);
+
     }
 };
 
@@ -143,6 +145,7 @@ public:
   std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
     if (args.size() < 2) return "-ERR wrong number of arguments\r\n";
 
+    store.type[args[0]] = std::string("string");
     store.kv[args[0]] = args[1];
     store.expiry.erase(args[0]); // clear exp if was present
 
@@ -174,6 +177,7 @@ public:
     if (args.empty()) return "-ERR wrong number of arguments\r\n";
 
     const std::string& key = args[0];
+    store.type[key] = std::string("string");
 
     // Lazy expiry check
     auto exp_it = store.expiry.find(key);
@@ -194,10 +198,10 @@ public:
 class TypeCommand : public Command {
   std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
     const std::string& key = args[0];
-    auto it = store.kv.find(key);
+    auto it = store.type.find(key);
 
-    if (it != store.kv.end()) {
-      return simple_string("string");
+    if (it != store.type.end()) {
+      return simple_string(store.type[key]);
     }
 
     return simple_string("none");
@@ -208,6 +212,8 @@ class LLenCommand : public Command {
 public:
   std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
     if (args.empty()) return "-ERR wrong args\r\n";
+ 
+    store.type[args[0]] = std::string("string"); 
 
     if (!store.lists.count(args[0])) return integer_resp(0);
     const auto& list = store.lists[args[0]];
@@ -220,6 +226,8 @@ class LPushCommand : public Command {
 public:
   std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
     if (args.size() < 2) return "-ERR wrong args\r\n";
+
+    store.type[args[0]] = std::string("string");
 
     auto& list = store.lists[args[0]];
     for (size_t i = 1; i < args.size(); i++) {
@@ -235,6 +243,8 @@ public:
   std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
     if (args.size() < 2) return "-ERR wrong number of arguments\r\n";
     const std::string& key = args[0];
+    store.type[key] = std::string("string");
+
     auto& list = store.lists[key];
     for (size_t i = 1; i < args.size(); i++)
       list.push_back(args[i]);
@@ -269,6 +279,7 @@ public:
     if (args.size() < 3) return "-ERR wrong args\r\n";
     if (!store.lists.count(args[0])) return "*0\r\n";
 
+    store.type[args[0]] = std::string("string");
     const auto& list = store.lists[args[0]];
     int start = std::stoi(args[1]);
     int end = std::stoi(args[2]);
@@ -290,6 +301,7 @@ public:
   std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
     if (args.empty()) return "-ERR wrong number of arguments\r\n";
 
+    store.type[args[0]] = std::string("string");
     auto it = store.lists.find(args[0]);
     if (it == store.lists.end() || it->second.empty()) return null_bulk();
     auto& list = it->second;
@@ -317,6 +329,7 @@ public:
     if (args.size() < 2) return "-ERR wrong number of arguments\r\n";
     
     const std::string& key = args[0];
+    store.type[key] = std::string("string");
     
     auto it = store.lists.find(key);
 
@@ -346,6 +359,17 @@ public:
   }
 };
 
+class XAddCommand : public Command {
+  std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
+    if (args.size() < 2) return "-ERR wrong number of arguments\r\n";
+    const std::string& key = args[0];
+    store.type[key] = std::string("stream");
+    const std::string& id = args[1];
+
+    return bulk(id);
+  }
+};
+
 std::unordered_map<std::string, std::unique_ptr<Command>> commands;
 
 void init_commands() {
@@ -361,6 +385,8 @@ void init_commands() {
   commands["LRANGE"] = std::make_unique<LRangeCommand>();
   commands["LPOP"]   = std::make_unique<LPopCommand>();
   commands["BLPOP"]  = std::make_unique<BLPopCommand>();
+
+  commands["XADD"]   = std::make_unique<XAddCommand>();
 }
 
 std::string dispatch(DataStore& store, Connection& conn, std::vector<std::string>& cmd) {
