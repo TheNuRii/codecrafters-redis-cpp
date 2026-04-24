@@ -68,6 +68,10 @@ std::string null_array() {
   return "*-1\r\n";
 }
 
+std::string simple_string(std::string s) {
+  return "+" + s + "\r\n";
+}
+
 class RespParser {
 public:
     void append(const std::string& data) {
@@ -120,9 +124,9 @@ class PingCommand : public Command {
 public:
     std::string execute(DataStore&, Connection&, const std::vector<std::string>& args) override {
         if (args.empty()) {
-            return "+PONG\r\n";
+            return simple_string("PONG");
         }
-        return "+" + args[0] + "\r\n";
+        return simple_string(args[0]);
     }
 };
 
@@ -160,7 +164,7 @@ public:
       }
     }
 
-    return "+OK\r\n";
+    return simple_string("OK");
   }
 };
 
@@ -184,6 +188,19 @@ public:
     auto it = store.kv.find(key);
     if (it == store.kv.end()) return null_bulk();
     return bulk(it->second);
+  }
+};
+
+class TypeCommand : public Command {
+  std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
+    const std::string& key = args[0];
+    auto it = store.kv.find(key);
+
+    if (it != store.kv.end()) {
+      return simple_string("string");
+    }
+
+    return simple_string("none");
   }
 };
 
@@ -336,6 +353,7 @@ void init_commands() {
   commands["ECHO"]   = std::make_unique<EchoCommand>();
   commands["SET"]    = std::make_unique<SetCommand>();
   commands["GET"]    = std::make_unique<GetCommand>();
+  commands["TYPE"]   = std::make_unique<TypeCommand>();
 
   commands["LLEN"]   = std::make_unique<LLenCommand>();
   commands["LPUSH"]  = std::make_unique<LPushCommand>();
