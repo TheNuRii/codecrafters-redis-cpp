@@ -18,6 +18,9 @@
 #define MAX_EVENTS 64
 #define BUFFER_SIZE 1024
 
+using Clock = std::chrono::steady_clock;
+using TimePoint = std::chrono::time_point<Clock>;
+
 struct Connection {
   int fd;
   std::string input_buffer;
@@ -25,6 +28,8 @@ struct Connection {
 
   bool blocked = false;
   std::string blocking_key;
+
+  std::optional<TimePoint> blpop_deadline;
 };
 
 class DataStore {
@@ -57,6 +62,10 @@ std::string array(const std::vector<std::string>& v) {
   }
 
   return res;
+}
+
+std::string null_array() {
+  return "*-1\r\n";
 }
 
 class RespParser {
@@ -140,12 +149,12 @@ public:
 
       if (opt == "EX") {
         int seconds = std::stoi(args[i + 1]);
-        store.expiry[args[0]] = std::chrono::steady_clock::now()
+        store.expiry[args[0]] = Clock::now()
                               + std::chrono::seconds(seconds);
         break;
       } else if (opt == "PX") {
         int ms = std::stoi(args[i + 1]);
-        store.expiry[args[0]] = std::chrono::steady_clock::now()
+        store.expiry[args[0]] = Clock::now()
                               + std::chrono::milliseconds(ms);
         break;
       }
@@ -165,7 +174,7 @@ public:
     // Lazy expiry check
     auto exp_it = store.expiry.find(key);
     if (exp_it != store.expiry.end()) {
-      if (std::chrono::steady_clock::now() >= exp_it->second) {
+      if (Clock::now() >= exp_it->second) {
         store.kv.erase(key);
         store.expiry.erase(exp_it);
         return null_bulk();
@@ -224,8 +233,10 @@ public:
         waiters.erase(waiters.begin());
         std::string val = list.front();
         list.erase(list.begin());
+
         c->output_buffer += array({key, val});
         c->blocked = false;
+        c->blpop_deadline = std::nullopt;
       }
 
       if (waiters.empty()) store.blocked.erase(key);
@@ -289,6 +300,7 @@ public:
     if (args.size() < 2) return "-ERR wrong number of arguments\r\n";
     
     const std::string& key = args[0];
+    
     auto it = store.lists.find(key);
 
     if (it != store.lists.end() && !it->second.empty()) {
@@ -302,7 +314,18 @@ public:
     conn.blocked = true;
     conn.blocking_key = key;
     store.blocked[key].push_back(&conn);
-    return ""; // send nothing now
+
+    int timeout_ms = (std::stod(args[1]) * 1000);
+
+    if (timeout_ms > 0) {
+      conn.blpop_deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
+    
+    } else {
+      conn.blpop_deadline = std::nullopt;
+    }
+
+
+    return ""; 
   }
 };
 
@@ -346,7 +369,7 @@ void flush_output(Connection& conn, int epoll_fd) {
     ssize_t n = write(conn.fd, conn.output_buffer.c_str(), conn.output_buffer.size());
 
     if (n < 0) {
-      if (errno = EAGAIN) {
+      if (errno == EAGAIN) {
         epoll_event ev{};
         ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
         ev.data.fd = conn.fd;
@@ -363,6 +386,58 @@ void flush_output(Connection& conn, int epoll_fd) {
   ev.events = EPOLLIN | EPOLLET;
   ev.data.fd = conn.fd;
   epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn.fd, &ev);
+}
+
+int compute_epoll_timeout(const std::unordered_map<int, Connection>& clients) {
+  int min_ms = -1;
+
+  for (const auto& [fd, conn] : clients) {
+    if (!conn.blocked || !conn.blpop_deadline) continue;
+
+    long long remainig = std::chrono::duration_cast<std::chrono::milliseconds>(
+      *conn.blpop_deadline - Clock::now()
+    ).count();
+
+    if (remainig <= 0) return 0;
+
+
+    int ms = std::max(1LL, remainig);
+    if (min_ms == -1 || remainig < min_ms) {
+      min_ms = ms;
+    }
+  }
+
+  return min_ms;
+}
+
+void check_blpop_timeouts(
+  std::unordered_map<int, Connection>& clients,
+  DataStore& store,
+  int epoll_fd
+) {
+  auto now = Clock::now();
+
+  for (auto& [fd, conn] : clients) {
+    if (!conn.blocked || !conn.blpop_deadline) continue;
+    if (now < *conn.blpop_deadline) continue;
+
+    // after Timeout 
+    conn.output_buffer += null_array();
+    conn.blocked = false;
+    conn.blpop_deadline = std::nullopt;
+
+    auto& waiters = store.blocked[conn.blocking_key];
+    
+    waiters.erase(std::remove(waiters.begin(), waiters.end(), &conn),
+            waiters.end()
+    );
+
+    if (waiters.empty()) {
+      store.blocked.erase(conn.blocking_key);
+    } 
+
+    flush_output(conn, epoll_fd);
+  }
 }
 
 int main() {
@@ -397,7 +472,10 @@ int main() {
   epoll_event events[MAX_EVENTS];
 
   while (true) {
-    int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+    int timeout_ms = compute_epoll_timeout(clients); // dynamic timeout
+    int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, timeout_ms);
+
+    check_blpop_timeouts(clients, store, epoll_fd);
 
     for (int i = 0; i < nfds; i++) {
       int fd = events[i].data.fd;
