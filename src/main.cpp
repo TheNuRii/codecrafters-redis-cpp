@@ -50,7 +50,7 @@ public:
   std::unordered_map<std::string, std::string> type;
 };
 
-// ----------------- COMMAND parsing and execution
+// ----------------- helper fun
 
 std::string bulk(const std::string& s) {
   return "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
@@ -85,6 +85,31 @@ std::string simple_string(std::string s) {
 std::string error(std::string s) {
   return "-" + s + "\r\n";
 }
+
+std::string generate_stream_id(const std::string& stream_key, DataStore& store) {
+  auto now = std::chrono::system_clock::now();
+  long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    now.time_since_epoch()
+  ).count();
+
+  auto it = store.streams.find(stream_key);
+  if (it == store.streams.end() || it->second.empty()) {
+    return std::to_string(ms) + "-0";
+  }
+
+  const std::string& last_id = it->second.back().id;
+  size_t dash = last_id.find("-");
+  long long last_ms = std::stoll(last_id.substr(0, dash));
+  long long last_seq = std::stoll(last_id.substr(dash + 1));
+
+  if (ms <= last_ms) {
+    return std::to_string(last_ms) + "-" + std::to_string(last_seq + 1);
+  }
+
+  return std::to_string(ms) + "-0";
+}
+
+// ------------ def commands
 
 class RespParser {
 public:
@@ -381,12 +406,41 @@ class XAddCommand : public Command {
     const std::string& key = args[0];
     std::string id = args[1];
     auto& entries = store.streams[key];
+
+    if (id == "*") {
+      id = generate_stream_id(key, store);
+    }
  
     size_t dash = id.find("-");
     if (dash == std::string::npos) return error("ERR invalid stream ID");
 
     long long current_ms = std::stoll(id.substr(0, dash));
-    int current_seq = std::stoi(id.substr(dash + 1));
+    std::string seq_part = id.substr(dash + 1);
+    long long current_seq;
+
+  
+    if (seq_part == "*") {
+    current_seq = 0; 
+
+    auto it = store.streams.find(key);
+    if (it != store.streams.end() && !it->second.empty()) {
+      const std::string& last_id = it->second.back().id;
+      size_t last_dash = last_id.find('-');
+      long long last_ms  = std::stoll(last_id.substr(0, last_dash));
+      long long last_seq = std::stoll(last_id.substr(last_dash + 1));
+
+      if (current_ms == last_ms) {
+        current_seq = last_seq + 1; 
+      }
+    }
+
+    if (current_ms == 0 && current_seq == 0) current_seq = 1;
+
+    id = std::to_string(current_ms) + "-" + std::to_string(current_seq);
+
+    } else {
+      current_seq = std::stoll(seq_part); 
+    }
 
     if (current_ms <= 0 && current_seq <= 0) {
       return error("ERR The ID specified in XADD must be greater than 0-0");
@@ -411,7 +465,7 @@ class XAddCommand : public Command {
     
     entries.push_back(std::move(entry));
     store.type[key] = "stream";
-    
+
     return bulk(id);
   }
 };
@@ -446,8 +500,6 @@ std::string dispatch(DataStore& store, Connection& conn, std::vector<std::string
     return commands[op]->execute(store, conn, 
         std::vector<std::string>(cmd.begin() + 1, cmd.end()));
 }
-
-// ---------------------------------------------------
 
 void set_non_blocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
