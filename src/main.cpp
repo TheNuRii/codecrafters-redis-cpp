@@ -32,10 +32,19 @@ struct Connection {
   std::optional<TimePoint> blpop_deadline;
 };
 
+struct StreamEntry {
+  std::string id;
+  std::vector<std::pair<std::string, std::string>> fields;
+};
+
 class DataStore {
 public:
+  //data containers
   std::unordered_map<std::string, std::string> kv;
   std::unordered_map<std::string, std::vector<std::string>> lists;
+  std::unordered_map<std::string, std::vector<StreamEntry>> streams;
+
+  // info data
   std::unordered_map<std::string, std::vector<Connection*>> blocked;
   std::unordered_map<std::string, std::chrono::steady_clock::time_point> expiry;
   std::unordered_map<std::string, std::string> type;
@@ -71,6 +80,10 @@ std::string null_array() {
 
 std::string simple_string(std::string s) {
   return "+" + s + "\r\n";
+}
+
+std::string error(std::string s) {
+  return "-" + s + "\r\n";
 }
 
 class RespParser {
@@ -361,11 +374,44 @@ public:
 
 class XAddCommand : public Command {
   std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
-    if (args.size() < 2) return "-ERR wrong number of arguments\r\n";
-    const std::string& key = args[0];
-    store.type[key] = std::string("stream");
-    const std::string& id = args[1];
+    if (args.size() < 4) return error("ERR wrong number of arguments");
 
+    if ((args.size() - 2) % 2 != 0) return error("ERR field-value pairs required");
+
+    const std::string& key = args[0];
+    std::string id = args[1];
+    auto& entries = store.streams[key];
+ 
+    size_t dash = id.find("-");
+    if (dash == std::string::npos) return error("ERR invalid stream ID");
+
+    long long current_ms = std::stoll(id.substr(0, dash));
+    int current_seq = std::stoi(id.substr(dash + 1));
+
+    if (current_ms <= 0 && current_seq <= 0) {
+      return error("ERR The ID specified in XADD must be greater than 0-0");
+    }
+
+    if (!entries.empty()) {
+      const std::string& last_id = entries.back().id;
+      size_t last_dash = last_id.find("-");
+      long long last_ms = std::stoll(last_id.substr(0, last_dash));
+      int last_seq = std::stoi(last_id.substr(last_dash + 1));
+
+      if (current_ms < last_ms || (current_ms == last_ms && current_seq <= last_seq)) {
+        return error("ERR The ID specified in XADD is equal or smaller than the target stream top item");
+      }
+    }
+    
+    StreamEntry entry;
+    entry.id = id;
+    for (size_t i = 2; i + 1 < args.size(); i += 2) {
+      entry.fields.push_back({args[i], args[i + 1]});
+    }
+    
+    entries.push_back(std::move(entry));
+    store.type[key] = "stream";
+    
     return bulk(id);
   }
 };
