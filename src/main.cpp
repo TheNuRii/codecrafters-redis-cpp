@@ -14,6 +14,7 @@
 #include <memory>
 #include <iterator>
 #include <chrono>
+#include <climits>
 
 #define MAX_EVENTS 64
 #define BUFFER_SIZE 1024
@@ -470,6 +471,64 @@ class XAddCommand : public Command {
   }
 };
 
+class XRANGECommand : public Command {
+  std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
+    if (args.size() < 3) return error("ERR wrong number of arguments\r\n");
+    
+    const std::string& key = args[0];
+
+    auto it = store.streams.find(key);
+    if (it == store.streams.end() || it->second.empty()) return "*0\r\n";
+
+    const auto& entries = it->second;
+
+    // pars (ms - seq) with case ("-" + "+")
+    auto parse_id = [](const std::string& s, bool is_start)
+      ->std::pair<long long, long long> 
+      {
+        if (s == "-") return {0, 0};
+        if (s == "+") return {LLONG_MAX, LLONG_MAX};
+        
+        size_t dash = s.find('-');
+        long long ms  = std::stoll(s.substr(0, dash));
+        long long seq = (dash == std::string::npos) // "ms" without seq
+                        ? (is_start ? 0 : LLONG_MAX)
+                        : std::stoll(s.substr(dash + 1));
+        
+        return {ms, seq};
+      };
+
+      auto [start_ms, start_seq] = parse_id(args[1], true);
+      auto [end_ms, end_seq]     = parse_id(args[2], false);
+
+      std::string response;
+      int count = 0;
+
+      for (const auto& entry : entries) {
+        size_t dash = entry.id.find('-');
+        long long cur_ms = std::stoll(entry.id.substr(0, dash));
+        long long cur_seq = std::stoll(entry.id.substr(dash + 1));
+
+        if (cur_ms < start_ms || (cur_ms == start_ms && cur_seq < start_seq)) continue;
+        if (cur_ms > end_ms   || (cur_ms == end_ms && cur_seq > end_seq)) break;
+        
+        std::string fields;
+        for (const auto& [field, value] : entry.fields) {
+          fields += bulk(field);
+          fields += bulk(value);
+        }
+
+        int field_count = entry.fields.size() * 2;
+        response += "*2\r\n";
+        response += bulk(entry.id); 
+        response += "*" + std::to_string(field_count) + "\r\n" + fields;
+        count++;
+      }
+
+    return "*" + std::to_string(count) + "\r\n" + response;
+  }
+};
+
 std::unordered_map<std::string, std::unique_ptr<Command>> commands;
 
 void init_commands() {
@@ -479,6 +538,7 @@ void init_commands() {
   commands["GET"]    = std::make_unique<GetCommand>();
   commands["TYPE"]   = std::make_unique<TypeCommand>();
 
+  // string commands
   commands["LLEN"]   = std::make_unique<LLenCommand>();
   commands["LPUSH"]  = std::make_unique<LPushCommand>();
   commands["RPUSH"]  = std::make_unique<RPushCommand>();
@@ -486,7 +546,9 @@ void init_commands() {
   commands["LPOP"]   = std::make_unique<LPopCommand>();
   commands["BLPOP"]  = std::make_unique<BLPopCommand>();
 
+  // stream commands
   commands["XADD"]   = std::make_unique<XAddCommand>();
+  commands["XRANGE"] = std::make_unique<XRANGECommand>();
 }
 
 std::string dispatch(DataStore& store, Connection& conn, std::vector<std::string>& cmd) {
@@ -699,7 +761,7 @@ int main() {
             flush_output(c, epoll_fd);
           }
         }
-      }
+      }  // NOWE: obsługa "ms-*"
     }
   }
 }
