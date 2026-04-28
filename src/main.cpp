@@ -83,9 +83,11 @@ std::string simple_string(std::string s) {
   return "+" + s + "\r\n";
 }
 
+// To fix 
 std::string error(std::string s) {
   return "-" + s + "\r\n";
 }
+// -----
 
 std::string generate_stream_id(const std::string& stream_key, DataStore& store) {
   auto now = std::chrono::system_clock::now();
@@ -529,6 +531,78 @@ class XRANGECommand : public Command {
   }
 };
 
+
+class XReadCommand : public Command {
+  std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
+    size_t streams_pos = std::string::npos;
+    for (size_t i = 0; i < args.size(); i++) {
+      std::string upper = args[i];
+      std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+      if (upper == "STREAMS") { streams_pos = i; break; }
+    }
+    if (streams_pos == std::string::npos) return "-ERR missing STREAMS\r\n";
+
+    size_t n = args.size() - streams_pos - 1;
+    if (n % 2 != 0) return "-ERR mismatched keys and IDs\r\n";
+    size_t num_streams = n / 2;
+
+    auto parse_id = [](const std::string& s) -> std::pair<long long, long long> {
+      if (s == "$") return {LLONG_MAX, LLONG_MAX}; // only new
+      size_t dash = s.find('-');
+      long long ms  = std::stoll(s.substr(0, dash));
+      long long seq = (dash == std::string::npos) ? 0 : std::stoll(s.substr(dash + 1));
+      return {ms, seq};
+    };
+
+    std::string outer;
+    int stream_count = 0;
+
+    for (size_t i = 0; i < num_streams; i++) {
+      const std::string& key = args[streams_pos + 1 + i];
+      const std::string& id  = args[streams_pos + 1 + num_streams + i];
+
+      auto it = store.streams.find(key);
+      if (it == store.streams.end()) continue;
+      const auto& entries = it->second;
+
+      auto [start_ms, start_seq] = parse_id(id);
+
+      std::string inner;
+      int count = 0;
+
+      for (const auto& entry : entries) {
+        size_t dash   = entry.id.find('-');
+        long long e_ms  = std::stoll(entry.id.substr(0, dash));
+        long long e_seq = std::stoll(entry.id.substr(dash + 1));
+
+        if (e_ms < start_ms || (e_ms == start_ms && e_seq <= start_seq)) continue;
+
+        std::string fields;
+        for (const auto& [field, value] : entry.fields) {
+          fields += bulk(field);
+          fields += bulk(value);
+        }
+        int field_count = entry.fields.size() * 2;
+
+        inner += "*2\r\n";
+        inner += bulk(entry.id);
+        inner += "*" + std::to_string(field_count) + "\r\n" + fields;
+        count++;
+      }
+
+      if (count == 0) continue; // skip new 
+
+      outer += "*2\r\n";
+      outer += bulk(key);
+      outer += "*" + std::to_string(count) + "\r\n" + inner;
+      stream_count++;
+    }
+
+    if (stream_count == 0) return "*0\r\n";
+    return "*" + std::to_string(stream_count) + "\r\n" + outer;
+  }
+};
+
 std::unordered_map<std::string, std::unique_ptr<Command>> commands;
 
 void init_commands() {
@@ -549,6 +623,7 @@ void init_commands() {
   // stream commands
   commands["XADD"]   = std::make_unique<XAddCommand>();
   commands["XRANGE"] = std::make_unique<XRANGECommand>();
+  commands["XREAD"]  = std::make_unique<XReadCommand>();
 }
 
 std::string dispatch(DataStore& store, Connection& conn, std::vector<std::string>& cmd) {
