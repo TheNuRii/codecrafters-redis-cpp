@@ -22,6 +22,12 @@
 using Clock = std::chrono::steady_clock;
 using TimePoint = std::chrono::time_point<Clock>;
 
+struct BlockedXRead {
+  std::string key;
+  long long last_ms;
+  long long last_seq;
+};
+
 struct Connection {
   int fd;
   std::string input_buffer;
@@ -31,6 +37,9 @@ struct Connection {
   std::string blocking_key;
 
   std::optional<TimePoint> blpop_deadline;
+
+  bool xread_blocked = false;
+  BlockedXRead xread_info;
 };
 
 struct StreamEntry {
@@ -49,6 +58,8 @@ public:
   std::unordered_map<std::string, std::vector<Connection*>> blocked;
   std::unordered_map<std::string, std::chrono::steady_clock::time_point> expiry;
   std::unordered_map<std::string, std::string> type;
+
+  std::unordered_map<std::string, std::vector<Connection*>> xread_waiters;
 };
 
 // ----------------- helper fun
@@ -110,6 +121,33 @@ std::string generate_stream_id(const std::string& stream_key, DataStore& store) 
   }
 
   return std::to_string(ms) + "-0";
+}
+
+std::string bulid_xread_response(const std::string& key, const std::vector<StreamEntry>& entries,
+                             long long start_ms, long long start_seq) {
+  std::string inner;
+  int count = 0;
+
+  for (const auto& entry : entries) {
+    size_t dash = entry.id.find("-");
+    long long e_ms = std::stoll(entry.id.substr(0, dash));
+    long long e_seq = std::stoll(entry.id.substr(dash + 1));
+
+    if (e_ms < start_ms || (e_ms == start_ms && e_seq <= start_seq)) continue;
+
+    std::string fields;
+    for (const auto& [field, value] : entry.fields) {
+      fields += bulk(field) + bulk(value);
+    }
+
+    inner += "*2\r\n" + bulk(entry.id) 
+          +  "*" + std::to_string(entry.fields.size() * 2) + "\r\n" +fields;
+    count++;
+  }
+
+  if (count == 0) return "";
+
+  return "*2\r\n" + bulk(key) + "*" + std::to_string(count) + "\r\n" + inner;
 }
 
 // ------------ def commands
@@ -445,7 +483,7 @@ class XAddCommand : public Command {
       current_seq = std::stoll(seq_part); 
     }
 
-    if (current_ms <= 0 && current_seq <= 0) {
+    if (current_ms == 0 && current_seq == 0) {
       return error("ERR The ID specified in XADD must be greater than 0-0");
     }
 
@@ -453,7 +491,7 @@ class XAddCommand : public Command {
       const std::string& last_id = entries.back().id;
       size_t last_dash = last_id.find("-");
       long long last_ms = std::stoll(last_id.substr(0, last_dash));
-      int last_seq = std::stoi(last_id.substr(last_dash + 1));
+      int last_seq = std::stoll(last_id.substr(last_dash + 1));
 
       if (current_ms < last_ms || (current_ms == last_ms && current_seq <= last_seq)) {
         return error("ERR The ID specified in XADD is equal or smaller than the target stream top item");
@@ -468,6 +506,32 @@ class XAddCommand : public Command {
     
     entries.push_back(std::move(entry));
     store.type[key] = "stream";
+
+    // wake-up after Xread block
+    if (store.xread_waiters.count(key)) {
+      auto& waiters = store.xread_waiters[key];
+      for (Connection* c : waiters) {
+        auto& info = c->xread_info;
+
+        std::string chunk = bulid_xread_response(
+          key, store.streams[key], info.last_ms, info.last_seq
+        );
+
+        if (!chunk.empty()) {
+          c->output_buffer += "*1\r\n" + chunk;
+          c->xread_blocked = false;
+          c->blpop_deadline = std::nullopt;
+        }
+      }
+
+      waiters.erase(
+        std::remove_if(waiters.begin(), waiters.end(),
+      [](Connection* c){return !c->xread_blocked;}),
+      waiters.end()
+      );
+
+      if (waiters.empty()) store.xread_waiters.erase(key);
+    }
 
     return bulk(id);
   }
@@ -533,21 +597,40 @@ class XRANGECommand : public Command {
 
 
 class XReadCommand : public Command {
-  std::string execute(DataStore& store, Connection&, const std::vector<std::string>& args) override {
-    size_t streams_pos = std::string::npos;
-    for (size_t i = 0; i < args.size(); i++) {
-      std::string upper = args[i];
-      std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
-      if (upper == "STREAMS") { streams_pos = i; break; }
-    }
-    if (streams_pos == std::string::npos) return "-ERR missing STREAMS\r\n";
+public:
+  std::string execute(DataStore& store, Connection& conn,
+                      const std::vector<std::string>& args) override {
+    if (args.size() < 3) return "-ERR wrong number of arguments\r\n";
 
-    size_t n = args.size() - streams_pos - 1;
-    if (n % 2 != 0) return "-ERR mismatched keys and IDs\r\n";
+    size_t pos = 0;
+    long long block_ms = -1;
+    bool blocking = false;
+
+  
+    while (pos < args.size()) {
+      std::string upper = args[pos];
+      std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+
+      if (upper == "COUNT") {
+        pos += 2; 
+      } else if (upper == "BLOCK") {
+        blocking = true;
+        block_ms = std::stoll(args[pos + 1]);
+        pos += 2;
+      } else if (upper == "STREAMS") {
+        pos++; // przesuń za "STREAMS"
+        break;
+      } else {
+        return "-ERR syntax error\r\n";
+      }
+    }
+
+    size_t n = args.size() - pos;
+    if (n == 0 || n % 2 != 0) return "-ERR mismatched keys and IDs\r\n";
     size_t num_streams = n / 2;
 
     auto parse_id = [](const std::string& s) -> std::pair<long long, long long> {
-      if (s == "$") return {LLONG_MAX, LLONG_MAX}; // only new
+      if (s == "$") return {LLONG_MAX, LLONG_MAX}; 
       size_t dash = s.find('-');
       long long ms  = std::stoll(s.substr(0, dash));
       long long seq = (dash == std::string::npos) ? 0 : std::stoll(s.substr(dash + 1));
@@ -558,8 +641,8 @@ class XReadCommand : public Command {
     int stream_count = 0;
 
     for (size_t i = 0; i < num_streams; i++) {
-      const std::string& key = args[streams_pos + 1 + i];
-      const std::string& id  = args[streams_pos + 1 + num_streams + i];
+      const std::string& key = args[pos + i];
+      const std::string& id  = args[pos + num_streams + i];
 
       auto it = store.streams.find(key);
       if (it == store.streams.end()) continue;
@@ -567,39 +650,57 @@ class XReadCommand : public Command {
 
       auto [start_ms, start_seq] = parse_id(id);
 
-      std::string inner;
-      int count = 0;
-
-      for (const auto& entry : entries) {
-        size_t dash   = entry.id.find('-');
-        long long e_ms  = std::stoll(entry.id.substr(0, dash));
-        long long e_seq = std::stoll(entry.id.substr(dash + 1));
-
-        if (e_ms < start_ms || (e_ms == start_ms && e_seq <= start_seq)) continue;
-
-        std::string fields;
-        for (const auto& [field, value] : entry.fields) {
-          fields += bulk(field);
-          fields += bulk(value);
+      if (id == "$") {
+        if (!entries.empty()) {
+          size_t dash   = entries.back().id.find('-');
+          start_ms  = std::stoll(entries.back().id.substr(0, dash));
+          start_seq = std::stoll(entries.back().id.substr(dash + 1));
+        } else {
+          start_ms = 0; start_seq = 0;
         }
-        int field_count = entry.fields.size() * 2;
-
-        inner += "*2\r\n";
-        inner += bulk(entry.id);
-        inner += "*" + std::to_string(field_count) + "\r\n" + fields;
-        count++;
       }
 
-      if (count == 0) continue; // skip new 
-
-      outer += "*2\r\n";
-      outer += bulk(key);
-      outer += "*" + std::to_string(count) + "\r\n" + inner;
-      stream_count++;
+      std::string chunk = bulid_xread_response(key, entries, start_ms, start_seq);
+      if (!chunk.empty()) {
+        outer += chunk;
+        stream_count++;
+      }
     }
 
-    if (stream_count == 0) return "*0\r\n";
-    return "*" + std::to_string(stream_count) + "\r\n" + outer;
+    if (stream_count > 0) {
+      return "*" + std::to_string(stream_count) + "\r\n" + outer;
+    }
+
+    if (!blocking) return "*0\r\n";
+
+    // --- BLOCKING ---
+    const std::string& key = args[pos];
+    const std::string& id  = args[pos + num_streams];
+
+    auto [start_ms, start_seq] = parse_id(id);
+
+    if (id == "$") {
+      auto it = store.streams.find(key);
+      if (it != store.streams.end() && !it->second.empty()) {
+        size_t dash   = it->second.back().id.find('-');
+        start_ms  = std::stoll(it->second.back().id.substr(0, dash));
+        start_seq = std::stoll(it->second.back().id.substr(dash + 1));
+      } else {
+        start_ms = 0; start_seq = 0;
+      }
+    }
+
+    conn.xread_blocked = true;
+    conn.xread_info    = {key, start_ms, start_seq};
+    store.xread_waiters[key].push_back(&conn);
+
+    if (block_ms > 0) {
+      conn.blpop_deadline = Clock::now() + std::chrono::milliseconds(block_ms);
+    } else {
+      conn.blpop_deadline = std::nullopt; 
+    }
+
+    return ""; 
   }
 };
 
@@ -671,7 +772,8 @@ int compute_epoll_timeout(const std::unordered_map<int, Connection>& clients) {
   int min_ms = -1;
 
   for (const auto& [fd, conn] : clients) {
-    if (!conn.blocked || !conn.blpop_deadline) continue;
+    bool has_deadline = (conn.blocked || conn.xread_blocked) && conn.blpop_deadline.has_value();
+    if (!has_deadline) continue;
 
     long long remainig = std::chrono::duration_cast<std::chrono::milliseconds>(
       *conn.blpop_deadline - Clock::now()
@@ -697,28 +799,40 @@ void check_blpop_timeouts(
   auto now = Clock::now();
 
   for (auto& [fd, conn] : clients) {
-    if (!conn.blocked || !conn.blpop_deadline) continue;
-    if (now < *conn.blpop_deadline) continue;
+    if (conn.blocked && conn.blpop_deadline && now >= *conn.blpop_deadline) {
+      // after Timeout 
+      conn.output_buffer += null_array();
+      conn.blocked = false;
+      conn.blpop_deadline = std::nullopt;
 
-    // after Timeout 
-    conn.output_buffer += null_array();
-    conn.blocked = false;
-    conn.blpop_deadline = std::nullopt;
-
-    auto& waiters = store.blocked[conn.blocking_key];
+      auto& waiters = store.blocked[conn.blocking_key];
     
-    waiters.erase(std::remove(waiters.begin(), waiters.end(), &conn),
+      waiters.erase(std::remove(waiters.begin(), waiters.end(), &conn),
             waiters.end()
-    );
-
-    if (waiters.empty()) {
+      );
+      if (waiters.empty()) {
       store.blocked.erase(conn.blocking_key);
-    } 
+      }
+      flush_output(conn, epoll_fd);
+    }
 
-    flush_output(conn, epoll_fd);
+    if (conn.xread_blocked && conn.blpop_deadline && now >= *conn.blpop_deadline) {
+      conn.output_buffer += null_array();
+      conn.xread_blocked = false;
+      conn.blpop_deadline = std::nullopt;
+
+      auto& waiters = store.xread_waiters[conn.xread_info.key];
+      waiters.erase(
+        std::remove(waiters.begin(), waiters.end(), &conn),
+        waiters.end()
+      );
+
+      if (waiters.empty()) store.xread_waiters.erase(conn.xread_info.key);
+
+      flush_output(conn, epoll_fd);
+    }
   }
 }
-
 int main() {
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
