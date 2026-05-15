@@ -18,23 +18,34 @@ The server is single-threaded and uses **Linux epoll in edge-triggered mode** fo
 
 Commands are implemented as a class hierarchy (`Command` base class, one subclass per command), registered in a dispatch table at startup. The RESP parser is incremental — it handles partial reads correctly by buffering input until a full command is available.
 
-```
-Client connects
+clients (TCP)
      │
      ▼
-epoll_wait() ──► new data ──► RespParser::append()
-                                     │
-                              getCommand() ready?
-                                     │
-                                     ▼
-                              dispatch() ──► Command::execute()
-                                                    │
-                                                    ▼
-                                          conn.output_buffer += response
-                                                    │
-                                                    ▼
-                                          flush_output() ──► write() to socket
-```
+┌─────────────┐
+│ epoll loop  │  edge-triggered, single thread
+│ (server.cpp)│
+└──────┬──────┘
+       │  raw bytes
+       ▼
+┌─────────────┐
+│ RespParser  │  stateful, handles partial TCP frames
+└──────┬──────┘
+       │  vector<string>
+       ▼
+┌──────────────────┐
+│ CommandRegistry  │  O(1) dispatch via unordered_map
+└──────┬───────────┘
+       │
+       ▼
+┌──────────────────────────────┐
+│           DataStore          │
+│  ┌─────────┐  ┌───────────┐ │
+│  │ KVStore │  │ ListStore │ │
+│  └─────────┘  └───────────┘ │
+│  ┌─────────────────────────┐ │
+│  │      StreamStore        │ │
+│  └─────────────────────────┘ │
+└──────────────────────────────┘
 
 ---
 
