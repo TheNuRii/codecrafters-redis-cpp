@@ -95,7 +95,7 @@ Core commands, lists, expiry, and streams are working and passing CodeCrafters t
 
 ```bash
 # Build
-g++ -std=c++23 -O2 -o server server.cpp
+g++ -std=c++23 -O2 -o main main.cpp
 
 # Run (listens on port 6379)
 ./server
