@@ -18,6 +18,11 @@ The server is single-threaded and uses **Linux epoll in edge-triggered mode** fo
 
 Commands are implemented as a class hierarchy (`Command` base class, one subclass per command), registered in a dispatch table at startup. The RESP parser is incremental — it handles partial reads correctly by buffering input until a full command is available.
 
+---
+
+## Architecture
+
+```
 clients (TCP)
      │
      ▼
@@ -46,35 +51,38 @@ clients (TCP)
 │  │      StreamStore        │ │
 │  └─────────────────────────┘ │
 └──────────────────────────────┘
+```
+
+### Key design decisions
+
+**Single thread, epoll edge-triggered** — no locking required anywhere. Edge-triggered mode means the kernel notifies once per state change, requiring a full drain loop on every `EPOLLIN` event. More complex to implement, but avoids spurious wakeups.
+
+**RESP parser is stateful** — TCP is a stream protocol. A single command may arrive split across multiple `read()` calls. `RespParser` buffers partial input and only yields a command when fully received.
+
+**Blocking commands without blocking the server** — `BLPOP` and `XREAD BLOCK` register the client's file descriptor in a wait list inside `DataStore`. The event loop continues handling other clients normally. When `RPUSH` or `XADD` arrives, it wakes up registered waiters by writing directly to their output buffers. Timeouts are handled via a dynamic `epoll_wait` timeout computed from the nearest deadline.
+
+**RAII socket ownership** — file descriptors are wrapped in a `Socket` class. `close()` is called exactly once, in the destructor, guaranteed even on early returns.
 
 ---
 
-## Implemented commands
+## Supported commands
 
-### Core
 | Command | Notes |
 |---|---|
-| `PING` | with optional message |
-| `ECHO` | |
-| `SET` | with `EX` and `PX` expiry options |
-| `GET` | with lazy expiry deletion |
-
-### Lists
-| Command | Notes |
-|---|---|
-| `RPUSH` | appends elements, wakes blocked `BLPOP` clients |
-| `LPUSH` | prepends elements, correct Redis ordering (`LPUSH key a b c` → `[c, b, a]`) |
-| `LRANGE` | with negative index support |
-| `LPOP` | with optional `count` argument |
-| `LLEN` | |
-| `BLPOP` | blocking pop with fractional second timeout (e.g. `0.2`) |
-
-### Streams
-| Command | Notes |
-|---|---|
-| `XADD` | auto ID (`*`), partial auto ID (`ms-*`), full ID validation |
-| `XRANGE` | with `-` and `+` boundary support |
-| `XREAD` | with `STREAMS`, `COUNT`, `BLOCK` — including `$` for new-entries-only |
+| `PING [message]` | |
+| `ECHO message` | |
+| `SET key value [EX seconds] [PX ms]` | lazy expiry |
+| `GET key` | |
+| `TYPE key` | returns `string`, `list`, `stream`, or `none` |
+| `LPUSH key value [value ...]` | |
+| `RPUSH key value [value ...]` | unblocks `BLPOP` waiters |
+| `LPOP key [count]` | |
+| `LRANGE key start stop` | negative indices supported |
+| `LLEN key` | |
+| `BLPOP key timeout` | blocks until data or timeout |
+| `XADD key id field value [...]` | `*`, `ms-*`, and explicit IDs |
+| `XRANGE key start end` | `-` and `+` supported |
+| `XREAD [COUNT n] [BLOCK ms] STREAMS key id` | `$` for new-entries-only |
 
 ---
 
@@ -95,29 +103,33 @@ clients (TCP)
 Core commands, lists, expiry, and streams are working and passing CodeCrafters tests.
 
 **Currently in progress — active refactoring:**
-- Cleaning up `XAddCommand` (ID validation edge cases, `0-0` check, wake-up logic for blocked `XREAD`)
-- Finalising `XReadCommand` with full `BLOCK` support, `$` ID resolution, and integration with `build_xread_response()`
-- Unifying timeout handling in `check_blpop_timeouts()` to cover both `BLPOP` and `XREAD BLOCK` in one pass
-- General cleanup: removing duplicated ID-parsing logic, standardising error responses
+
+The project started as a working but monolithic implementation and is currently being restructured into the clean architecture described above. The refactor covers safety (RAII sockets, eliminating raw Connection* pointers in favour of stable file descriptors), correctness (enum-based type system fixing silent type corruption bugs, unified BlockState making invalid connection states unrepresentable), architecture (decomposing a God Object DataStore into focused sub-stores, replacing a global command map with an encapsulated CommandRegistry), and performance (switching vector to deque for O(1) front pop, eliminating hot-path argument copies with std::span). Modularization into the file structure shown above and this documentation are the final remaining steps.
 
 ---
 
-## Building and running
+## Build & run
+
+**Requirements:** GCC 12+ or Clang 15+, CMake 3.20+, Linux (epoll).
 
 ```bash
-# Build
-g++ -std=c++23 -O2 -o main main.cpp
+git clone https://github.com/<you>/redis-clone
+cd redis-clone
+mkdir build && cd build
 
-# Run (listens on port 6379)
-./server
+# debug build — AddressSanitizer + UBSan enabled
+cmake .. -DCMAKE_BUILD_TYPE=Debug
+cmake --build .
 
-# Test with redis-cli
-redis-cli PING
-redis-cli SET foo bar EX 5
-redis-cli RPUSH mylist a b c
-redis-cli BLPOP mylist 1
-redis-cli XADD mystream '*' field value
-redis-cli XREAD STREAMS mystream 0-0
+./redis_clone
+```
+
+Connect with any Redis client:
+
+```bash
+redis-cli ping
+redis-cli set foo bar
+redis-cli get foo
 ```
 
 ---
